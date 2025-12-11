@@ -36,17 +36,27 @@ The pipeline uses Linux agents (`Auto-Scaling-Agents-Linux`), so if you're devel
 
 ## Build Pipeline - How It Actually Works
 
-The build pipeline is split into two files, which is a bit confusing at first but makes sense once you understand the pattern.
+The build pipeline uses a template pattern that MetLife uses across projects. Here's how it actually works:
 
 ### The Entry Point (`build-pipelines-ci.yml`)
 
 This file is pretty minimal - it just sets up the pipeline name format, agent pool, and which branches trigger builds. Then it extends a template from another repo (`14031_pipeline-template`). This is MetLife's standard pattern - they keep common pipeline templates in a separate repo so multiple projects can reuse them.
 
+The key line is:
+```yaml
+extends:
+  template: build-pipelines/Gulp/14031_digital-soh-function.yml@14031_pipeline-template
+```
+
+This tells Azure DevOps to use the template file from the `14031_pipeline-template` repo, specifically from the `build-pipelines/Gulp/` directory. The template repo is referenced as a resource at the top of the file.
+
 The pipeline name format `$(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)` means you'll see builds like `feat_simple_function_20251016.4`. The `.r` is a revision number that increments if multiple builds happen on the same day.
 
-### The Real Pipeline (`14031_digital-soh-function.yml`)
+**Important:** There's also a `14031_digital-soh-function.yml` file in this repo, but that's likely just a local copy for reference. The actual pipeline uses the template from the `14031_pipeline-template` repo. If you need to change pipeline behavior, you'll need to update the template in that repo (or get the DevOps team to do it).
 
-This is where all the action happens. Let me break down what actually runs:
+### The Template Pipeline (`14031_digital-soh-function.yml` in template repo)
+
+The actual pipeline logic lives in the template repo at `build-pipelines/Gulp/14031_digital-soh-function.yml`. This is where all the action happens. Let me break down what actually runs:
 
 **1. Environment Setup**
 - First thing it does is print all environment variables. Super helpful when debugging - you can see exactly what the pipeline sees
@@ -60,7 +70,8 @@ This is where all the action happens. Let me break down what actually runs:
 
 **3. Dependency Installation**
 - Runs `npm install` - pretty standard
-- Downloads a secure `.npmrc` file. This is for accessing MetLife's private npm registry (Artifactory). If this step fails, you probably don't have access to the Artifactory credentials variable group
+- Downloads a secure `.npmrc` file using the `DownloadSecureFile@1` task. This is for accessing MetLife's private npm registry (Artifactory). The file is named `.npmrc` and gets copied to the working directory
+- If this step fails, you probably don't have access to the Artifactory credentials variable group, or the secure file isn't configured in the library
 
 **4. Testing**
 - This step is optional - it only runs if you have a `test` script in `package.json`
@@ -68,35 +79,68 @@ This is where all the action happens. Let me break down what actually runs:
 
 **5. Veracode Security Scanning**
 - This prepares files for Veracode SAST scanning
-- It creates a zip file with your source code (excluding tests, node_modules, etc.)
-- The zip gets published as an artifact, but the actual Veracode scan happens elsewhere (probably in a separate pipeline or manually)
+- Uses `CopyFiles@2` to copy source files (JS/TS files, package.json) to a staging directory, excluding test files, node_modules, coverage, etc.
+- Creates a zip file named `repo_$(Build.BuildId).zip` in the veracode staging directory
+- The zip gets published as an artifact (`repo-zip`), but the actual Veracode scan happens elsewhere (probably in a separate pipeline or manually)
+- Also publishes the veracode directory as a build artifact for SCA (Software Composition Analysis) scanning
 - Note: `VERACODE_PIPELINE_SCAN_ENABLED` is set to `0`, so automated scanning in the pipeline is disabled. The artifacts are just prepared for manual scanning
 
 **6. Build Artifact Creation**
 - This is the important part - it creates a zip file with your function code
-- Excludes all the stuff you don't need in production (node_modules, tests, coverage, etc.)
-- The zip is named `azure_function_$(Build.BuildId).zip` and published as `azure-function-deployment`
+- Uses `ArchiveFiles@2` to create `azure_function_$(Build.BuildId).zip` in the `build/` directory
+- Excludes all the stuff you don't need in production: node_modules, .git, test files, coverage, and the build directory itself (to avoid recursive zipping)
+- The zip is published as a pipeline artifact named `azure-function-deployment`
 - This artifact is what the release pipeline will deploy
+- **Important conditions**: This only runs if it's NOT a pull request AND the branch is in the allowed list (`IsBranchesIncluded`). PR builds skip artifact publishing to save resources
 
 ### Pipeline Variables - What You Need to Know
 
-Here are the key variables and what they actually mean:
+The template defines several variables. Here are the key ones and what they actually mean:
 
 - `NODE_TOOL_VERSION: 22.20.0` - Don't change this unless you know what you're doing. Other projects might depend on this version
 - `FUNCTION_APP_NAME: func14031-metlife-soh-functions` - This is your function app name in Azure
 - `FUNCTION_APP_RESOURCE_GROUP: rg14031-metlife-soh-functions` - The resource group where everything lives
 - `AZ_SUBSCRIPTION: SPAZDO14031NP01` - The Azure subscription ID. You'll need access to this subscription to deploy
+- `BUILD_SONAR_PROJECT_KEY_NAME: Employee_Digital_14031_metlife_soh_functions` - SonarQube project identifier
+- `VERACODE_IMPORT_RESULTS: true` - Whether to import Veracode scan results
+- `VERACODE_PIPELINE_SCAN_ENABLED: 0` - Disables automated Veracode scanning in the pipeline
+- `IsPullRequest` - Automatically detects if this is a PR build
+- `IsBranchesIncluded` - Checks if the current branch is in the allowed list (master, develop, feat/*, release/*, etc.)
 
 The variable groups (`Veracode`, `ARTIFACTORY_CREDENTIALS`, `SONAR`) are managed by the DevOps team. If you need access or something's not working, talk to them.
 
+### Template Parameters
+
+The template also accepts parameters:
+- `build_app` (default: "Nodejs") - Not really used in this pipeline, but kept for consistency with other templates
+- `BUILD_REPOSITORY_LOCALPATH` (default: `$(Build.Repository.LocalPath)`) - Used for the test step working directory
+
 ### When Does the Pipeline Run?
 
-The pipeline triggers on:
-- Pushes to `master`, `develop`, or `feat/simple_function`
-- Changes to specific paths: `HttpTrigger/*`, `package.json`, `host.json`, `local.settings.json`, `index.js`
-- Pull requests (though PR builds might skip artifact publishing)
+The template defines triggers that work in combination:
+
+**Branch Triggers:**
+- `master`
+- `develop`
+- `feat/simple_function`
+- `feature/feature-*` (any branch starting with `feature/feature-`)
+- `develop-de1`, `develop-de2`, `develop-ops` (team-specific dev branches)
+- `release/release-*` (any release branch)
+- `release/hotfix-*` (any hotfix branch)
+
+**Path Triggers:**
+- `HttpTrigger/*` - Any changes in the HttpTrigger directory
+- `package.json` - Dependency changes
+- `host.json` - Host configuration changes
+- `local.settings.json` - Local settings (though this shouldn't be committed)
+- `index.js` - Main entry point changes
 
 The path triggers are smart - if you only change a README, the pipeline won't run. But if you touch any of those key files, it will.
+
+**Pull Requests:**
+- PR builds run automatically (pre-merge validation)
+- PR builds skip artifact publishing (saves resources, since you can't deploy from a PR anyway)
+- SonarQube analysis runs differently for PRs - it compares against the target branch instead of doing a full branch analysis
 
 ## Release Pipeline - Getting Code to Azure
 
@@ -362,13 +406,25 @@ The pipeline triggers on most of these branches, so you'll get builds automatica
 
 ## Things I Wish I Knew When I Started
 
-1. **The pipeline template is in a different repo** - If you need to change pipeline behavior, you might need to update the template repo, not this one
-2. **SonarQube will block your PR** - Don't ignore it, fix the issues early
-3. **Local.settings.json is gitignored for a reason** - Don't commit secrets or local config
-4. **The function key changes** - If you're testing against Azure, the key might rotate, so don't hardcode it
-5. **Application Insights is your friend** - When something breaks in Azure, check the logs there first
-6. **The release pipeline is UI-based** - You can't version control it like the build pipeline, so changes need to be made in Azure DevOps UI
-7. **Disabled tasks are usually fine** - Don't panic if you see disabled tasks, they're often conditionally disabled
+1. **The pipeline template is in a different repo** - The actual pipeline logic is in `14031_pipeline-template` repo at `build-pipelines/Gulp/14031_digital-soh-function.yml`. The file in this repo is just a reference copy. If you need to change pipeline behavior, you'll need to update the template repo (or get the DevOps team to do it)
+
+2. **SonarQube will block your PR** - The quality gate is set to wait (`sonar.qualitygate.wait=true`), so your PR won't merge if SonarQube fails. Don't ignore it, fix the issues early
+
+3. **PR builds don't publish artifacts** - This is intentional. The `IsPullRequest` variable prevents artifact publishing on PRs, which saves build resources. Only merged builds create deployable artifacts
+
+4. **The npmrc file is a secure file** - It's stored in the Azure DevOps library as a secure file, not in the repo. The pipeline downloads it automatically. For local dev, you might need to get this file from someone or configure Artifactory access manually
+
+5. **SonarQube exclusions are extensive** - It excludes a lot of stuff (yml files, d.ts files, coverage, tests, etc.). This is normal - you don't want to analyze generated files or test code
+
+6. **The function key changes** - If you're testing against Azure, the key might rotate, so don't hardcode it
+
+7. **Application Insights is your friend** - When something breaks in Azure, check the logs there first
+
+8. **The release pipeline is UI-based** - You can't version control it like the build pipeline, so changes need to be made in Azure DevOps UI
+
+9. **Disabled tasks are usually fine** - Don't panic if you see disabled tasks, they're often conditionally disabled
+
+10. **The test step continues on error** - Tests can fail and the build will still succeed. This is both good (doesn't block on flaky tests) and bad (you might miss real failures). Check test results manually if you're unsure
 
 ## Getting Help
 
@@ -379,7 +435,9 @@ If you're stuck:
 4. Ask the DevOps team about pipeline issues
 5. Ask the Azure admin about permission/resource issues
 
-The project is in the **MetLife-Global / Employee_Digital** organization in Azure DevOps. The pipeline template repo is **14031_pipeline-template** if you need to look at that.
+The project is in the **MetLife-Global / Employee_Digital** organization in Azure DevOps. 
+
+The pipeline template repo is **14031_pipeline-template** and the actual template file is at `build-pipelines/Gulp/14031_digital-soh-function.yml`. If you need to modify the pipeline, that's where you'll need to make changes (or coordinate with the DevOps team).
 
 ## Quick Reference
 
